@@ -1,0 +1,33 @@
+Reference,Value,Footprint,Quantity,Description,Manufacturer,Part Number,Supplier,Price
+U1,ESP32-C6-WROOM-1,RF_Module:ESP32-C6-WROOM-1,1,ESP32-C6 WiFi/BT/Zigbee Module,Espressif,ESP32-C6-WROOM-1,Mouser,4.50€
+U2,HT1621,SSOP-28,1,LCD Controller/Driver,Holtek,HT1621B,LCSC,0.80€
+U3-U5,PC817,DIP-4,3,Optocoupler for Triac isolation,Sharp,PC817X2NSZ0F,Mouser,0.35€
+U6,AMS1117-3.3,SOT-223,1,3.3V Linear Regulator,AMS,AMS1117-3.3,LCSC,0.15€
+U7,HLK-PM03,Module,1,AC-DC 3.3V 3W Power Module,Hi-Link,HLK-PM03,Mouser,3.50€
+Q1-Q3,BSS138,SOT-23,3,N-Channel MOSFET Level Shifter,ON Semi,BSS138,LCSC,0.05€
+Q4-Q6,MOC3021,DIP-6,3,Triac Driver Optocoupler,Lite-On,MOC3021M,Mouser,0.60€
+D1,1N4007,DO-41,1,Rectifier Diode,Vishay,1N4007-E3/54,LCSC,0.02€
+D2-D4,LED,0805,3,Status LEDs,Kingbright,APT2012SRCPRV,LCSC,0.05€
+R1-R3,330,0805,3,LED Current Limiting,Yageo,RC0805FR-07330RL,LCSC,0.01€
+R4-R9,10k,0805,6,Pull-up Resistors,Yageo,RC0805FR-0710KL,LCSC,0.01€
+R10-R12,1k,0805,3,Optocoupler Current Limiting,Yageo,RC0805FR-071KL,LCSC,0.01€
+R13-R15,470,1206,3,Triac Gate Resistors,Yageo,RC1206FR-07470RL,LCSC,0.01€
+R16-R18,100,2W,3,Snubber Resistors,Yageo,FMP200JR-52-100R,Mouser,0.15€
+C1,470uF,Radial,1,Bulk Capacitor,Nichicon,UVR1V471MPD,LCSC,0.15€
+C2-C3,22uF,0805,2,Decoupling Capacitors,Samsung,CL21A226MAQNNNE,LCSC,0.05€
+C4-C6,100nF,0805,3,Bypass Capacitors,Samsung,CL21B104KBCNNNC,LCSC,0.01€
+C7-C9,10nF,1206,3,Snubber Capacitors 275VAC,KEMET,R46KI310000M1M,Mouser,0.25€
+C10-C11,22pF,0805,2,Crystal Load Capacitors,Samsung,CL21C220JBANNNC,LCSC,0.01€
+Y1,32.768kHz,Crystal,1,RTC Crystal,Abracon,ABS07-32.768KHZ-T,LCSC,0.10€
+J1,USB-C,USB-C-16P,1,Programming Connector,CUI Devices,UJC-HP-3-SMT-TR,Mouser,0.80€
+J2,JST-XH-6P,JST-XH,1,LCD Connector,JST,B6B-XH-A,LCSC,0.05€
+J3,JST-XH-8P,JST-XH,1,Button Matrix Connector,JST,B8B-XH-A,LCSC,0.06€
+J4,Terminal-3P,Terminal,1,AC Power Input,Phoenix,1935161,Mouser,1.20€
+J5,Terminal-6P,Terminal,1,Triac Output,Phoenix,1935187,Mouser,2.40€
+J6,JST-XH-4P,JST-XH,1,Temperature Sensor,JST,B4B-XH-A,LCSC,0.04€
+SW1,Tactile,6x6mm,1,Reset Button,Omron,B3F-1000,LCSC,0.05€
+SW2,Tactile,6x6mm,1,Boot Button,Omron,B3F-1000,LCSC,0.05€
+F1,Fuse 1A,Fuse Holder,1,Primary Protection,Littelfuse,0217001.MXP,Mouser,0.50€
+MOV1,275V,Disc,1,Surge Protection,Littelfuse,V275LA4P,Mouser,0.35€
+PCB,2-layer FR4,100x80mm,1,Custom PCB fabrication,JLCPCB,-,JLCPCB,5.00€
+,,,,,,,Total:,~25€
