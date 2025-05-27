@@ -326,13 +326,13 @@
       (property "Footprint" "" (at -1.778 0 90)
         (effects (font (size 1.27 1.27)) hide)
       )
-      (symbol "Device:R_0_1"
+      (symbol "R_0_1"
         (rectangle (start -1.016 -2.54) (end 1.016 2.54)
           (stroke (width 0.254) (type default))
           (fill (type none))
         )
       )
-      (symbol "Device:R_1_1"
+      (symbol "R_1_1"
         (pin passive line (at 0 3.81 270) (length 1.27)
           (name "~" (effects (font (size 1.27 1.27))))
           (number "1" (effects (font (size 1.27 1.27))))
@@ -353,7 +353,7 @@
       (property "Footprint" "" (at 0.9652 -3.81 0)
         (effects (font (size 1.27 1.27)) hide)
       )
-      (symbol "Device:C_0_1"
+      (symbol "C_0_1"
         (polyline
           (pts
             (xy -2.032 -0.762)
@@ -371,7 +371,7 @@
           (fill (type none))
         )
       )
-      (symbol "Device:C_1_1"
+      (symbol "C_1_1"
         (pin passive line (at 0 3.81 270) (length 2.794)
           (name "~" (effects (font (size 1.27 1.27))))
           (number "1" (effects (font (size 1.27 1.27))))
