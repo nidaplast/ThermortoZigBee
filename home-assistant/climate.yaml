@@ -1,0 +1,206 @@
+# Configuration Home Assistant pour ThermortoZigBee
+# À ajouter dans configuration.yaml ou dans un package
+
+climate:
+  - platform: mqtt
+    name: "Radiateur Salon"
+    unique_id: "thermor_zigbee_salon"
+    modes:
+      - "off"
+      - "heat"
+    mode_command_topic: "zigbee2mqtt/thermor_salon/set/system_mode"
+    mode_state_topic: "zigbee2mqtt/thermor_salon/system_mode"
+    mode_state_template: "{{ value_json.system_mode }}"
+    
+    temperature_command_topic: "zigbee2mqtt/thermor_salon/set/occupied_heating_setpoint"
+    temperature_state_topic: "zigbee2mqtt/thermor_salon/occupied_heating_setpoint"
+    temperature_state_template: "{{ value_json.occupied_heating_setpoint }}"
+    current_temperature_topic: "zigbee2mqtt/thermor_salon/local_temperature"
+    current_temperature_template: "{{ value_json.local_temperature }}"
+    
+    min_temp: 5
+    max_temp: 30
+    temp_step: 0.5
+    
+    preset_modes:
+      - "comfort"
+      - "eco"
+      - "away"
+      - "boost"
+    preset_mode_command_topic: "zigbee2mqtt/thermor_salon/set/preset"
+    preset_mode_state_topic: "zigbee2mqtt/thermor_salon/preset"
+    preset_mode_value_template: "{{ value_json.preset }}"
+    
+    action_topic: "zigbee2mqtt/thermor_salon/running_state"
+    action_template: >
+      {% if value_json.running_state == "heat" %}
+        heating
+      {% else %}
+        idle
+      {% endif %}
+    
+    # Attributs supplémentaires
+    json_attributes_topic: "zigbee2mqtt/thermor_salon"
+    json_attributes_template: >
+      {
+        "heating_power": {{ value_json.pi_heating_demand | default(0) }},
+        "presence": {{ value_json.occupancy | default(false) }},
+        "window_open": {{ value_json.window_open | default(false) }},
+        "power_consumption": {{ value_json.power | default(0) }},
+        "linkquality": {{ value_json.linkquality | default(0) }}
+      }
+
+# Personnalisation de l'entité
+homeassistant:
+  customize:
+    climate.radiateur_salon:
+      friendly_name: "Radiateur Salon"
+      icon: mdi:radiator
+
+# Automatisations exemples
+automation:
+  # Mode Eco automatique la nuit
+  - alias: "Radiateur Salon - Mode Eco la nuit"
+    trigger:
+      - platform: time
+        at: "22:30:00"
+    condition:
+      - condition: state
+        entity_id: climate.radiateur_salon
+        state: "heat"
+    action:
+      - service: climate.set_preset_mode
+        target:
+          entity_id: climate.radiateur_salon
+        data:
+          preset_mode: "eco"
+  
+  # Retour en mode Confort le matin
+  - alias: "Radiateur Salon - Mode Confort le matin"
+    trigger:
+      - platform: time
+        at: "06:30:00"
+    condition:
+      - condition: state
+        entity_id: climate.radiateur_salon
+        state: "heat"
+      - condition: state
+        entity_id: binary_sensor.workday_sensor
+        state: "on"
+    action:
+      - service: climate.set_preset_mode
+        target:
+          entity_id: climate.radiateur_salon
+        data:
+          preset_mode: "comfort"
+  
+  # Coupure si fenêtre ouverte
+  - alias: "Radiateur Salon - Coupure fenêtre ouverte"
+    trigger:
+      - platform: state
+        entity_id: binary_sensor.fenetre_salon
+        to: "on"
+        for:
+          minutes: 2
+    action:
+      - service: climate.turn_off
+        target:
+          entity_id: climate.radiateur_salon
+      - service: notify.mobile_app
+        data:
+          title: "Chauffage coupé"
+          message: "Le radiateur du salon a été éteint car la fenêtre est ouverte"
+  
+  # Réactivation à la fermeture
+  - alias: "Radiateur Salon - Réactivation fenêtre fermée"
+    trigger:
+      - platform: state
+        entity_id: binary_sensor.fenetre_salon
+        to: "off"
+    condition:
+      - condition: numeric_state
+        entity_id: sensor.temperature_exterieure
+        below: 18
+    action:
+      - service: climate.turn_on
+        target:
+          entity_id: climate.radiateur_salon
+
+# Capteurs calculés
+sensor:
+  # Consommation journalière
+  - platform: integration
+    source: sensor.radiateur_salon_power
+    name: "Consommation Radiateur Salon"
+    unit_prefix: k
+    round: 2
+    
+  # Coût journalier
+  - platform: template
+    sensors:
+      cout_radiateur_salon:
+        friendly_name: "Coût Radiateur Salon"
+        unit_of_measurement: "€"
+        value_template: >
+          {% set conso = states('sensor.consommation_radiateur_salon') | float(0) %}
+          {% set tarif = states('sensor.tarif_electricite') | float(0.15) %}
+          {{ (conso * tarif) | round(2) }}
+
+# Groupe pour carte Lovelace
+group:
+  chauffage_salon:
+    name: "Chauffage Salon"
+    entities:
+      - climate.radiateur_salon
+      - sensor.radiateur_salon_heating_power
+      - sensor.radiateur_salon_power_consumption
+      - binary_sensor.radiateur_salon_presence
+      - binary_sensor.radiateur_salon_window_open
+
+# Scripts utiles
+script:
+  # Boost temporaire
+  boost_radiateur_salon:
+    alias: "Boost Radiateur Salon"
+    sequence:
+      - service: climate.set_preset_mode
+        target:
+          entity_id: climate.radiateur_salon
+        data:
+          preset_mode: "boost"
+      - delay:
+          hours: 1
+      - service: climate.set_preset_mode
+        target:
+          entity_id: climate.radiateur_salon
+        data:
+          preset_mode: "comfort"
+  
+  # Programme vacances
+  mode_vacances_chauffage:
+    alias: "Mode Vacances Chauffage"
+    sequence:
+      - service: climate.set_temperature
+        target:
+          entity_id: climate.radiateur_salon
+        data:
+          temperature: 12
+      - service: climate.set_preset_mode
+        target:
+          entity_id: climate.radiateur_salon
+        data:
+          preset_mode: "away"
+
+# Intégration avec Google Assistant / Alexa
+cloud:
+  google_actions:
+    filter:
+      include_entities:
+        - climate.radiateur_salon
+    entity_config:
+      climate.radiateur_salon:
+        name: "Radiateur du salon"
+        aliases:
+          - "chauffage salon"
+          - "radiateur"
+        room: "Salon"

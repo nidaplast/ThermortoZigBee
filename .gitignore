@@ -1,0 +1,50 @@
+# Build files
+build/
+*.bin
+*.elf
+*.map
+
+# ESP-IDF
+sdkconfig.old
+.vscode/
+.devcontainer/
+
+# KiCad
+*.kicad_pcb-bak
+*.kicad_sch-bak
+*.kicad_pro.lck
+fp-info-cache
+*-backups/
+*.net
+*.dsn
+*.ses
+
+# Gerbers
+*.gbr
+*.drl
+*.pos
+*.zip
+
+# OS
+.DS_Store
+Thumbs.db
+*.swp
+*~
+
+# Python
+__pycache__/
+*.pyc
+.env
+venv/
+
+# IDE
+.idea/
+*.iml
+.vscode/
+*.code-workspace
+
+# Project specific
+logs/
+temp/
+*.log
+secrets.h

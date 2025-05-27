@@ -1,0 +1,223 @@
+# Carte Lovelace pour ThermortoZigBee
+# À ajouter dans votre dashboard Home Assistant
+
+type: vertical-stack
+cards:
+  # Carte thermostat principale
+  - type: thermostat
+    entity: climate.radiateur_salon
+    name: Radiateur Salon
+    features:
+      - type: climate-hvac-modes
+        hvac_modes:
+          - 'off'
+          - heat
+      - type: climate-preset-modes
+        style: dropdown
+        preset_modes:
+          - comfort
+          - eco
+          - away
+          - boost
+    
+  # Graphique température
+  - type: custom:mini-graph-card
+    name: Température Salon
+    entities:
+      - entity: climate.radiateur_salon
+        attribute: current_temperature
+        name: Actuelle
+        color: blue
+      - entity: climate.radiateur_salon
+        attribute: temperature
+        name: Consigne
+        color: orange
+    hours_to_show: 24
+    points_per_hour: 2
+    line_width: 2
+    animate: true
+    show:
+      labels: true
+      points: false
+      legend: true
+    
+  # Informations détaillées
+  - type: entities
+    title: Détails Radiateur
+    show_header_toggle: false
+    entities:
+      # Puissance de chauffe
+      - type: custom:slider-entity-row
+        entity: sensor.radiateur_salon_heating_power
+        name: Puissance
+        icon: mdi:fire
+        unit: '%'
+        
+      # Consommation
+      - entity: sensor.radiateur_salon_power_consumption
+        name: Consommation actuelle
+        icon: mdi:flash
+        
+      # Consommation journalière
+      - entity: sensor.consommation_radiateur_salon
+        name: Consommation aujourd'hui
+        icon: mdi:counter
+        
+      # Coût
+      - entity: sensor.cout_radiateur_salon
+        name: Coût aujourd'hui
+        icon: mdi:currency-eur
+        
+      # Présence
+      - entity: binary_sensor.radiateur_salon_presence
+        name: Présence détectée
+        icon: mdi:motion-sensor
+        
+      # Fenêtre
+      - entity: binary_sensor.radiateur_salon_window_open
+        name: Fenêtre ouverte
+        icon: mdi:window-open
+        
+      # Qualité du signal
+      - type: custom:bar-card
+        entity: sensor.radiateur_salon_linkquality
+        name: Signal Zigbee
+        icon: mdi:signal
+        min: 0
+        max: 255
+        severity:
+          - color: red
+            from: 0
+            to: 100
+          - color: yellow
+            from: 100
+            to: 200
+          - color: green
+            from: 200
+            to: 255
+            
+  # Actions rapides
+  - type: horizontal-stack
+    cards:
+      - type: button
+        name: Boost 1h
+        icon: mdi:rocket-launch
+        tap_action:
+          action: call-service
+          service: script.boost_radiateur_salon
+        entity: script.boost_radiateur_salon
+        
+      - type: button
+        name: Mode Eco
+        icon: mdi:leaf
+        tap_action:
+          action: call-service
+          service: climate.set_preset_mode
+          service_data:
+            entity_id: climate.radiateur_salon
+            preset_mode: eco
+            
+      - type: button
+        name: Éteindre
+        icon: mdi:power
+        tap_action:
+          action: call-service
+          service: climate.turn_off
+          service_data:
+            entity_id: climate.radiateur_salon
+
+# Alternative : Carte custom plus moderne
+# Nécessite l'installation de custom:thermostat-card via HACS
+
+type: custom:thermostat-card
+entity: climate.radiateur_salon
+title: Radiateur Salon
+no_card: false
+step: 0.5
+decimals: 1
+highlight_tap: true
+chevron_size: 50
+pending: 2
+idle_zone: 1
+ambient_temperature: sensor.temperature_salon
+hvac_mode:
+  'off': 'mdi:power'
+  heat: 'mdi:fire'
+features:
+  - preset
+  - humidity
+  - power
+preset:
+  comfort:
+    icon: mdi:home
+    name: Confort
+  eco:
+    icon: mdi:leaf
+    name: Eco
+  away:
+    icon: mdi:home-export-outline
+    name: Absent
+  boost:
+    icon: mdi:rocket-launch
+    name: Boost
+layout:
+  mode:
+    names: true
+    icons: true
+    headings: false
+  preset:
+    names: true
+    icons: true
+    headings: false
+style: |
+  ha-card {
+    --st-font-size-xl: 24px;
+    --st-font-size-m: 14px;
+    --st-font-size-title: 20px;
+    --st-spacing: 4px;
+  }
+
+# Carte statistiques avancées
+type: custom:apexcharts-card
+header:
+  show: true
+  title: Analyse Chauffage Salon
+  show_states: true
+  colorize_states: true
+series:
+  - entity: climate.radiateur_salon
+    attribute: current_temperature
+    name: Température
+    stroke_width: 2
+    color: blue
+    yaxis_id: temp
+  - entity: climate.radiateur_salon
+    attribute: temperature
+    name: Consigne
+    stroke_width: 2
+    color: orange
+    yaxis_id: temp
+    opacity: 0.6
+  - entity: sensor.radiateur_salon_heating_power
+    name: Puissance
+    stroke_width: 1
+    color: red
+    yaxis_id: power
+    type: area
+    opacity: 0.3
+yaxis:
+  - id: temp
+    decimals: 1
+    apex_config:
+      title:
+        text: Température (°C)
+  - id: power
+    opposite: true
+    decimals: 0
+    max: 100
+    apex_config:
+      title:
+        text: Puissance (%)
+graph_span: 24h
+span:
+  end: hour

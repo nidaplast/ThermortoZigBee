@@ -1,0 +1,15 @@
+idf_component_register(
+    SRCS 
+        "main.c"
+        "thermor_zigbee.c"
+    INCLUDE_DIRS 
+        "."
+    REQUIRES 
+        driver
+        esp_zigbee_lib
+        nvs_flash
+        esp_timer
+        freertos
+        esp_adc
+        esp_hw_support
+)
