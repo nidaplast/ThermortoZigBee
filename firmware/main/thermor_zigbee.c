@@ -1,450 +1,707 @@
 /**
  * @file thermor_zigbee.c
- * @brief Thermor Zigbee application implementation
+ * @brief Main implementation file for Thermor Zigbee Controller
+ * @date 2024-01-15
  */
 
-#include <string.h>
-#include "freertos/FreeRTOS.h"
-#include "freertos/task.h"
-#include "freertos/timers.h"
-#include "freertos/semphr.h"
-#include "esp_log.h"
-#include "esp_timer.h"
-#include "driver/gpio.h"
-#include "driver/gptimer.h"
-#include "driver/temperature_sensor.h"
-#include "esp_adc/adc_oneshot.h"
-#include "esp_zigbee_core.h"
-#include "esp_zigbee_endpoint.h"
-#include "esp_zigbee_cluster.h"
-#include "esp_zigbee_attribute.h"
-#include "zcl/esp_zigbee_zcl_thermostat.h"
 #include "thermor_zigbee.h"
+#include "esp_timer.h"
+#include "esp_random.h"
+#include "nvs_flash.h"
+#include "nvs.h"
+#include "driver/gpio.h"
+#include "driver/timer.h"
+#include "esp_zigbee_core.h"
 
-static const char *TAG = "THERMOR_ZB";
+// Logging tag
+static const char *TAG = "thermor_zigbee";
 
-/* Zigbee configuration */
-#define INSTALLCODE_POLICY_ENABLE    false
-#define ESP_ZB_PRIMARY_CHANNEL_MASK   ESP_ZB_TRANSCEIVER_ALL_CHANNELS_MASK
-#define THERMOR_ENDPOINT_ID          1
+// Global variables
+system_config_t g_system_config = {0};
+SemaphoreHandle_t g_config_mutex = NULL;
+QueueHandle_t g_event_queue = NULL;
 
-/* Temperature control parameters */
-#define TEMP_MIN                     5.0f
-#define TEMP_MAX                     30.0f
-#define TEMP_HYSTERESIS             0.5f
-#define PID_KP                       10.0f
-#define PID_KI                       0.1f
-#define PID_KD                       1.0f
+// Private variables
+static TaskHandle_t main_task_handle = NULL;
+static TaskHandle_t temp_task_handle = NULL;
+static TaskHandle_t ui_task_handle = NULL;
+static TaskHandle_t zigbee_task_handle = NULL;
+static esp_timer_handle_t system_timer = NULL;
+static nvs_handle_t nvs_handle = 0;
 
-/* Timing parameters */
-#define ZERO_CROSS_TIMEOUT_MS        25
-#define CONTROL_LOOP_PERIOD_MS       1000
-#define ZIGBEE_REPORT_PERIOD_MS      30000
+// Forward declarations
+static void main_task(void *pvParameters);
+static void temperature_task(void *pvParameters);
+static void ui_task(void *pvParameters);
+static void zigbee_task(void *pvParameters);
+static void system_timer_callback(void *arg);
+static esp_err_t gpio_init(void);
+static esp_err_t load_default_config(void);
+static esp_err_t init_nvs(void);
 
-/* Global state */
-static thermor_state_t g_thermor_state = {
-    .current_temp = 20.0f,
-    .target_temp = 20.0f,
-    .heating_power = 0,
-    .mode = THERMOSTAT_MODE_COMFORT,
-    .presence_detected = false,
-    .window_open = false,
-    .heating_active = false,
-    .power_consumption = 0
-};
-
-static SemaphoreHandle_t g_state_mutex;
-static gptimer_handle_t g_phase_timer;
-static esp_timer_handle_t g_control_timer;
-static esp_timer_handle_t g_report_timer;
-
-/* PID controller state */
-static struct {
-    float integral;
-    float prev_error;
-} g_pid_state = {0};
-
-/* Forward declarations */
-static void control_loop_callback(void *arg);
-static void zigbee_report_callback(void *arg);
-static void IRAM_ATTR zero_cross_isr(void *arg);
-static void IRAM_ATTR phase_timer_callback(gptimer_handle_t timer, const gptimer_alarm_event_data_t *edata, void *user_data);
-static esp_err_t init_hardware(void);
-static esp_err_t init_zigbee(void);
-static void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct);
-static float calculate_pid_output(float setpoint, float current_value);
-static void update_heating_power(uint8_t power);
-
+/**
+ * @brief Initialize the Thermor Zigbee system
+ */
 esp_err_t thermor_zigbee_init(void)
 {
-    esp_err_t ret;
-
-    // Create mutex for state protection
-    g_state_mutex = xSemaphoreCreateMutex();
-    if (!g_state_mutex) {
-        ESP_LOGE(TAG, "Failed to create state mutex");
+    esp_err_t ret = ESP_OK;
+    
+    ESP_LOGI(TAG, "Initializing Thermor Zigbee Controller...");
+    
+    // Initialize NVS
+    ret = init_nvs();
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to initialize NVS");
+        return ret;
+    }
+    
+    // Create synchronization primitives
+    g_config_mutex = xSemaphoreCreateMutex();
+    if (g_config_mutex == NULL) {
+        ESP_LOGE(TAG, "Failed to create config mutex");
         return ESP_ERR_NO_MEM;
     }
-
-    // Initialize hardware
-    ret = init_hardware();
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Hardware initialization failed");
-        return ret;
+    
+    g_event_queue = xQueueCreate(20, sizeof(system_event_t));
+    if (g_event_queue == NULL) {
+        ESP_LOGE(TAG, "Failed to create event queue");
+        vSemaphoreDelete(g_config_mutex);
+        return ESP_ERR_NO_MEM;
     }
-
-    // Initialize Zigbee
-    ret = init_zigbee();
+    
+    // Initialize GPIO pins
+    ret = gpio_init();
     if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Zigbee initialization failed");
-        return ret;
+        ESP_LOGE(TAG, "Failed to initialize GPIO");
+        goto error;
     }
-
-    // Create control loop timer
-    const esp_timer_create_args_t control_timer_args = {
-        .callback = control_loop_callback,
-        .name = "control_loop"
+    
+    // Load configuration or set defaults
+    ret = thermor_config_load();
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "No saved config found, loading defaults");
+        ret = load_default_config();
+        if (ret != ESP_OK) {
+            goto error;
+        }
+    }
+    
+    // Create system timer
+    esp_timer_create_args_t timer_args = {
+        .callback = system_timer_callback,
+        .arg = NULL,
+        .name = "system_timer"
     };
-    ESP_ERROR_CHECK(esp_timer_create(&control_timer_args, &g_control_timer));
-    ESP_ERROR_CHECK(esp_timer_start_periodic(g_control_timer, CONTROL_LOOP_PERIOD_MS * 1000));
+    ret = esp_timer_create(&timer_args, &system_timer);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to create system timer");
+        goto error;
+    }
+    
+    ESP_LOGI(TAG, "Thermor Zigbee Controller initialized successfully");
+    return ESP_OK;
+    
+error:
+    if (g_config_mutex) vSemaphoreDelete(g_config_mutex);
+    if (g_event_queue) vQueueDelete(g_event_queue);
+    return ret;
+}
 
-    // Create Zigbee report timer
-    const esp_timer_create_args_t report_timer_args = {
-        .callback = zigbee_report_callback,
-        .name = "zigbee_report"
-    };
-    ESP_ERROR_CHECK(esp_timer_create(&report_timer_args, &g_report_timer));
-    ESP_ERROR_CHECK(esp_timer_start_periodic(g_report_timer, ZIGBEE_REPORT_PERIOD_MS * 1000));
-
-    ESP_LOGI(TAG, "Thermor Zigbee initialized successfully");
+/**
+ * @brief Start the Thermor system
+ */
+esp_err_t thermor_system_start(void)
+{
+    BaseType_t ret;
+    
+    ESP_LOGI(TAG, "Starting Thermor system...");
+    
+    // Create main task
+    ret = xTaskCreate(main_task, "main_task", MAIN_TASK_STACK_SIZE, 
+                      NULL, MAIN_TASK_PRIORITY, &main_task_handle);
+    if (ret != pdPASS) {
+        ESP_LOGE(TAG, "Failed to create main task");
+        return ESP_ERR_NO_MEM;
+    }
+    
+    // Create temperature monitoring task
+    ret = xTaskCreate(temperature_task, "temp_task", TEMP_TASK_STACK_SIZE,
+                      NULL, TEMP_TASK_PRIORITY, &temp_task_handle);
+    if (ret != pdPASS) {
+        ESP_LOGE(TAG, "Failed to create temperature task");
+        return ESP_ERR_NO_MEM;
+    }
+    
+    // Create UI task
+    ret = xTaskCreate(ui_task, "ui_task", UI_TASK_STACK_SIZE,
+                      NULL, UI_TASK_PRIORITY, &ui_task_handle);
+    if (ret != pdPASS) {
+        ESP_LOGE(TAG, "Failed to create UI task");
+        return ESP_ERR_NO_MEM;
+    }
+    
+    // Create Zigbee task
+    ret = xTaskCreate(zigbee_task, "zigbee_task", ZIGBEE_TASK_STACK_SIZE,
+                      NULL, ZIGBEE_TASK_PRIORITY, &zigbee_task_handle);
+    if (ret != pdPASS) {
+        ESP_LOGE(TAG, "Failed to create Zigbee task");
+        return ESP_ERR_NO_MEM;
+    }
+    
+    // Start system timer (1 second interval)
+    esp_timer_start_periodic(system_timer, 1000000); // 1 second in microseconds
+    
+    // Set system state to idle
+    xSemaphoreTake(g_config_mutex, portMAX_DELAY);
+    g_system_config.state = STATE_IDLE;
+    xSemaphoreGive(g_config_mutex);
+    
+    ESP_LOGI(TAG, "Thermor system started successfully");
     return ESP_OK;
 }
 
-static esp_err_t init_hardware(void)
+/**
+ * @brief Stop the Thermor system
+ */
+void thermor_system_stop(void)
 {
-    // Configure GPIOs
-    gpio_config_t io_conf = {
-        .mode = GPIO_MODE_OUTPUT,
-        .pin_bit_mask = (1ULL << GPIO_TRIAC_CTRL) | (1ULL << GPIO_LED_STATUS) | (1ULL << GPIO_LED_HEATING),
-        .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .pull_up_en = GPIO_PULLUP_DISABLE,
-        .intr_type = GPIO_INTR_DISABLE
-    };
-    gpio_config(&io_conf);
+    ESP_LOGI(TAG, "Stopping Thermor system...");
+    
+    // Stop system timer
+    if (system_timer) {
+        esp_timer_stop(system_timer);
+    }
+    
+    // Delete tasks
+    if (main_task_handle) vTaskDelete(main_task_handle);
+    if (temp_task_handle) vTaskDelete(temp_task_handle);
+    if (ui_task_handle) vTaskDelete(ui_task_handle);
+    if (zigbee_task_handle) vTaskDelete(zigbee_task_handle);
+    
+    // Turn off heating
+    gpio_set_level(GPIO_TRIAC_CONTROL, 0);
+    
+    // Save configuration
+    thermor_config_save();
+    
+    ESP_LOGI(TAG, "Thermor system stopped");
+}
 
-    // Configure input GPIOs
+/**
+ * @brief Main control task
+ */
+static void main_task(void *pvParameters)
+{
+    system_event_t event;
+    TickType_t last_wake_time = xTaskGetTickCount();
+    
+    ESP_LOGI(TAG, "Main task started");
+    
+    while (1) {
+        // Wait for events with timeout
+        if (xQueueReceive(g_event_queue, &event, pdMS_TO_TICKS(100)) == pdTRUE) {
+            xSemaphoreTake(g_config_mutex, portMAX_DELAY);
+            
+            switch (event.type) {
+                case EVENT_BUTTON_PRESS:
+                    ESP_LOGD(TAG, "Button %d pressed", event.data.button_id);
+                    // Handle button press
+                    break;
+                    
+                case EVENT_TEMP_UPDATE:
+                    g_system_config.temperature.current = event.data.temperature;
+                    g_system_config.temperature.last_update = esp_timer_get_time() / 1000;
+                    ESP_LOGD(TAG, "Temperature updated: %.1f°C", event.data.temperature);
+                    break;
+                    
+                case EVENT_PRESENCE_CHANGE:
+                    g_system_config.presence.pir_detected = event.data.state;
+                    if (event.data.state) {
+                        g_system_config.presence.last_motion = esp_timer_get_time() / 1000000;
+                    }
+                    ESP_LOGD(TAG, "Presence changed: %s", event.data.state ? "detected" : "absent");
+                    break;
+                    
+                case EVENT_WINDOW_CHANGE:
+                    g_system_config.presence.window_open = event.data.state;
+                    ESP_LOGD(TAG, "Window state: %s", event.data.state ? "open" : "closed");
+                    break;
+                    
+                case EVENT_ZIGBEE_CMD:
+                    ESP_LOGD(TAG, "Zigbee command: 0x%02x", event.data.zigbee_cmd);
+                    // Handle Zigbee commands
+                    break;
+                    
+                default:
+                    break;
+            }
+            
+            xSemaphoreGive(g_config_mutex);
+        }
+        
+        // Perform control logic every 100ms
+        xSemaphoreTake(g_config_mutex, portMAX_DELAY);
+        
+        // Temperature control with hysteresis
+        if (g_system_config.temperature.valid) {
+            float temp_diff = g_system_config.temperature.target - g_system_config.temperature.current;
+            
+            if (g_system_config.mode != MODE_OFF) {
+                if (temp_diff > TEMP_HYSTERESIS) {
+                    // Need heating
+                    if (g_system_config.state != STATE_HEATING) {
+                        g_system_config.state = STATE_HEATING;
+                        ESP_LOGI(TAG, "Starting heating (current: %.1f, target: %.1f)",
+                                g_system_config.temperature.current,
+                                g_system_config.temperature.target);
+                    }
+                } else if (temp_diff < -TEMP_HYSTERESIS) {
+                    // Temperature reached
+                    if (g_system_config.state == STATE_HEATING) {
+                        g_system_config.state = STATE_IDLE;
+                        ESP_LOGI(TAG, "Target temperature reached");
+                    }
+                }
+            }
+        }
+        
+        // Apply heating control
+        if (g_system_config.state == STATE_HEATING && !g_system_config.presence.window_open) {
+            // Calculate required power based on temperature difference
+            float temp_diff = g_system_config.temperature.target - g_system_config.temperature.current;
+            uint8_t power = (uint8_t)(temp_diff * 20); // Simple proportional control
+            if (power > 100) power = 100;
+            
+            g_system_config.power.target_percent = power;
+        } else {
+            g_system_config.power.target_percent = 0;
+        }
+        
+        xSemaphoreGive(g_config_mutex);
+        
+        // Delay until next cycle
+        vTaskDelayUntil(&last_wake_time, pdMS_TO_TICKS(100));
+    }
+}
+
+/**
+ * @brief Temperature monitoring task
+ */
+static void temperature_task(void *pvParameters)
+{
+    TickType_t last_wake_time = xTaskGetTickCount();
+    
+    ESP_LOGI(TAG, "Temperature task started");
+    
+    while (1) {
+        // Read temperature sensor (placeholder - implement actual sensor reading)
+        // For now, simulate temperature reading
+        float temperature = 20.0f + ((float)(esp_random() % 100) - 50) / 100.0f;
+        
+        // Send temperature update event
+        system_event_t event = {
+            .type = EVENT_TEMP_UPDATE,
+            .data.temperature = temperature
+        };
+        xQueueSend(g_event_queue, &event, 0);
+        
+        // Check PIR sensor
+        bool pir_state = gpio_get_level(GPIO_PIR_SENSOR);
+        static bool last_pir_state = false;
+        if (pir_state != last_pir_state) {
+            last_pir_state = pir_state;
+            event.type = EVENT_PRESENCE_CHANGE;
+            event.data.state = pir_state;
+            xQueueSend(g_event_queue, &event, 0);
+        }
+        
+        // Check window sensor
+        bool window_state = gpio_get_level(GPIO_WINDOW_SENSOR);
+        static bool last_window_state = false;
+        if (window_state != last_window_state) {
+            last_window_state = window_state;
+            event.type = EVENT_WINDOW_CHANGE;
+            event.data.state = window_state;
+            xQueueSend(g_event_queue, &event, 0);
+        }
+        
+        // Delay until next reading
+        vTaskDelayUntil(&last_wake_time, pdMS_TO_TICKS(TEMP_SAMPLE_PERIOD_MS));
+    }
+}
+
+/**
+ * @brief UI handling task
+ */
+static void ui_task(void *pvParameters)
+{
+    ESP_LOGI(TAG, "UI task started");
+    
+    while (1) {
+        // Handle button scanning and LCD updates
+        // Placeholder for actual implementation
+        
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+}
+
+/**
+ * @brief Zigbee communication task
+ */
+static void zigbee_task(void *pvParameters)
+{
+    ESP_LOGI(TAG, "Zigbee task started");
+    
+    // Initialize Zigbee stack
+    // Placeholder for actual Zigbee implementation
+    
+    while (1) {
+        // Handle Zigbee communication
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+}
+
+/**
+ * @brief System timer callback (1 second interval)
+ */
+static void system_timer_callback(void *arg)
+{
+    system_event_t event = {
+        .type = EVENT_TIMER_TICK
+    };
+    xQueueSend(g_event_queue, &event, 0);
+}
+
+/**
+ * @brief Initialize GPIO pins
+ */
+static esp_err_t gpio_init(void)
+{
+    gpio_config_t io_conf = {0};
+    
+    // Configure output pins
+    io_conf.intr_type = GPIO_INTR_DISABLE;
+    io_conf.mode = GPIO_MODE_OUTPUT;
+    io_conf.pin_bit_mask = (1ULL << GPIO_TRIAC_CONTROL) | 
+                          (1ULL << GPIO_LCD_CS) |
+                          (1ULL << GPIO_LCD_WR) |
+                          (1ULL << GPIO_LCD_DATA) |
+                          (1ULL << GPIO_STATUS_LED);
+    io_conf.pull_down_en = GPIO_PULLDOWN_DISABLE;
+    io_conf.pull_up_en = GPIO_PULLUP_DISABLE;
+    gpio_config(&io_conf);
+    
+    // Configure input pins with interrupts
+    io_conf.intr_type = GPIO_INTR_POSEDGE;
     io_conf.mode = GPIO_MODE_INPUT;
-    io_conf.pin_bit_mask = (1ULL << GPIO_PIR_SENSOR) | (1ULL << GPIO_BUTTON_MODE) | 
-                           (1ULL << GPIO_BUTTON_PLUS) | (1ULL << GPIO_BUTTON_MINUS);
+    io_conf.pin_bit_mask = (1ULL << GPIO_ZERO_CROSS);
+    io_conf.pull_down_en = GPIO_PULLDOWN_ENABLE;
+    io_conf.pull_up_en = GPIO_PULLUP_DISABLE;
+    gpio_config(&io_conf);
+    
+    // Configure input pins without interrupts
+    io_conf.intr_type = GPIO_INTR_DISABLE;
+    io_conf.pin_bit_mask = (1ULL << GPIO_TEMP_SENSOR) |
+                          (1ULL << GPIO_PIR_SENSOR) |
+                          (1ULL << GPIO_BTN_ROW1) |
+                          (1ULL << GPIO_BTN_ROW2) |
+                          (1ULL << GPIO_BTN_ROW3) |
+                          (1ULL << GPIO_WINDOW_SENSOR) |
+                          (1ULL << GPIO_PRESENCE_OVERRIDE);
     io_conf.pull_up_en = GPIO_PULLUP_ENABLE;
     gpio_config(&io_conf);
-
-    // Configure zero crossing interrupt
-    io_conf.pin_bit_mask = (1ULL << GPIO_ZERO_CROSS);
-    io_conf.pull_up_en = GPIO_PULLUP_DISABLE;
-    io_conf.intr_type = GPIO_INTR_NEGEDGE;
+    
+    // Configure button columns as open-drain outputs
+    io_conf.mode = GPIO_MODE_OUTPUT_OD;
+    io_conf.pin_bit_mask = (1ULL << GPIO_BTN_COL1) |
+                          (1ULL << GPIO_BTN_COL2) |
+                          (1ULL << GPIO_BTN_COL3);
     gpio_config(&io_conf);
-    gpio_install_isr_service(0);
-    gpio_isr_handler_add(GPIO_ZERO_CROSS, zero_cross_isr, NULL);
-
-    // Configure phase control timer
-    gptimer_config_t timer_config = {
-        .clk_src = GPTIMER_CLK_SRC_DEFAULT,
-        .direction = GPTIMER_COUNT_UP,
-        .resolution_hz = 1000000, // 1MHz, 1us resolution
-    };
-    ESP_ERROR_CHECK(gptimer_new_timer(&timer_config, &g_phase_timer));
-
-    gptimer_alarm_config_t alarm_config = {
-        .reload_count = 0,
-        .alarm_count = 5000, // Default 5ms delay
-        .flags.auto_reload_on_alarm = false,
-    };
-    ESP_ERROR_CHECK(gptimer_set_alarm_action(g_phase_timer, &alarm_config));
-
-    gptimer_event_callbacks_t cbs = {
-        .on_alarm = phase_timer_callback,
-    };
-    ESP_ERROR_CHECK(gptimer_register_event_callbacks(g_phase_timer, &cbs, NULL));
-    ESP_ERROR_CHECK(gptimer_enable(g_phase_timer));
-
-    ESP_LOGI(TAG, "Hardware initialized");
+    
+    // Set initial states
+    gpio_set_level(GPIO_TRIAC_CONTROL, 0);
+    gpio_set_level(GPIO_STATUS_LED, 0);
+    gpio_set_level(GPIO_LCD_CS, 1);
+    gpio_set_level(GPIO_LCD_WR, 1);
+    
     return ESP_OK;
 }
 
-static esp_err_t init_zigbee(void)
+/**
+ * @brief Initialize NVS
+ */
+static esp_err_t init_nvs(void)
 {
-    esp_zb_cfg_t zb_nwk_cfg = ESP_ZB_ZED_CONFIG();
-    esp_zb_init(&zb_nwk_cfg);
+    esp_err_t ret = nvs_flash_init();
+    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        ret = nvs_flash_init();
+    }
+    return ret;
+}
 
-    // Create endpoint
-    esp_zb_cluster_list_t *cluster_list = esp_zb_zcl_cluster_list_create();
+/**
+ * @brief Load default configuration
+ */
+static esp_err_t load_default_config(void)
+{
+    xSemaphoreTake(g_config_mutex, portMAX_DELAY);
     
-    // Basic cluster
-    esp_zb_attribute_list_t *basic_cluster = esp_zb_basic_cluster_create(NULL);
-    esp_zb_cluster_list_add_basic_cluster(cluster_list, basic_cluster, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE);
+    // Set default values
+    g_system_config.mode = MODE_ECO;
+    g_system_config.state = STATE_INIT;
+    g_system_config.temperature.target = 20.0f;
+    g_system_config.temperature.offset = 0.0f;
+    g_system_config.temperature.valid = false;
+    g_system_config.power.current_percent = 0;
+    g_system_config.power.target_percent = 0;
+    g_system_config.power.soft_start_active = true;
+    g_system_config.presence.absence_timer_min = 60;
+    g_system_config.child_lock = false;
+    g_system_config.adaptive_start = true;
+    g_system_config.open_window_detection = true;
+    g_system_config.lcd_brightness = 80;
     
-    // Thermostat cluster
-    esp_zb_thermostat_cluster_cfg_t thermostat_cfg = {
-        .local_temperature = (int16_t)(g_thermor_state.current_temp * 100),
-        .occupied_cooling_setpoint = 0x0A28, // Not used
-        .occupied_heating_setpoint = (int16_t)(g_thermor_state.target_temp * 100),
-        .control_sequence_of_operation = ESP_ZB_ZCL_THERMOSTAT_CONTROL_SEQ_HEATING_ONLY,
-        .system_mode = ESP_ZB_ZCL_THERMOSTAT_MODE_HEAT,
-    };
-    esp_zb_attribute_list_t *thermostat_cluster = esp_zb_thermostat_cluster_create(&thermostat_cfg);
-    esp_zb_cluster_list_add_thermostat_cluster(cluster_list, thermostat_cluster, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE);
-
-    // Create endpoint
-    esp_zb_endpoint_config_t endpoint_config = {
-        .endpoint = THERMOR_ENDPOINT_ID,
-        .app_profile_id = ESP_ZB_AF_HA_PROFILE_ID,
-        .app_device_id = ESP_ZB_HA_THERMOSTAT_DEVICE_ID,
-        .app_device_version = 0
-    };
+    // Clear schedule
+    memset(g_system_config.schedule, 0, sizeof(g_system_config.schedule));
     
-    esp_zb_ep_list_t *ep_list = esp_zb_ep_list_create();
-    esp_zb_ep_list_add_ep(ep_list, cluster_list, endpoint_config);
+    xSemaphoreGive(g_config_mutex);
     
-    esp_zb_device_register(ep_list);
-    esp_zb_set_primary_network_channel_set(ESP_ZB_PRIMARY_CHANNEL_MASK);
-    
-    ESP_ERROR_CHECK(esp_zb_start(false));
-    esp_zb_main_loop_iteration();
-
     return ESP_OK;
 }
 
-static void IRAM_ATTR zero_cross_isr(void *arg)
+/**
+ * @brief Save configuration to NVS
+ */
+esp_err_t thermor_config_save(void)
 {
-    // Start phase control timer with calculated delay
-    gptimer_start(g_phase_timer);
+    esp_err_t ret;
+    
+    ret = nvs_open("thermor", NVS_READWRITE, &nvs_handle);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to open NVS handle");
+        return ret;
+    }
+    
+    xSemaphoreTake(g_config_mutex, portMAX_DELAY);
+    
+    // Save configuration blob
+    ret = nvs_set_blob(nvs_handle, "config", &g_system_config, sizeof(g_system_config));
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to save config");
+    } else {
+        ret = nvs_commit(nvs_handle);
+        ESP_LOGI(TAG, "Configuration saved");
+    }
+    
+    xSemaphoreGive(g_config_mutex);
+    
+    nvs_close(nvs_handle);
+    return ret;
 }
 
-static void IRAM_ATTR phase_timer_callback(gptimer_handle_t timer, const gptimer_alarm_event_data_t *edata, void *user_data)
+/**
+ * @brief Load configuration from NVS
+ */
+esp_err_t thermor_config_load(void)
 {
-    // Fire triac
-    gpio_set_level(GPIO_TRIAC_CTRL, 1);
-    // Short pulse to trigger triac
-    ets_delay_us(10);
-    gpio_set_level(GPIO_TRIAC_CTRL, 0);
+    esp_err_t ret;
+    size_t length = sizeof(g_system_config);
     
-    // Stop timer until next zero crossing
-    gptimer_stop(timer);
+    ret = nvs_open("thermor", NVS_READONLY, &nvs_handle);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+    
+    xSemaphoreTake(g_config_mutex, portMAX_DELAY);
+    
+    ret = nvs_get_blob(nvs_handle, "config", &g_system_config, &length);
+    if (ret == ESP_OK && length == sizeof(g_system_config)) {
+        ESP_LOGI(TAG, "Configuration loaded");
+    } else {
+        ret = ESP_ERR_NOT_FOUND;
+    }
+    
+    xSemaphoreGive(g_config_mutex);
+    
+    nvs_close(nvs_handle);
+    return ret;
 }
 
-static void control_loop_callback(void *arg)
+/**
+ * @brief Reset configuration to defaults
+ */
+esp_err_t thermor_config_reset(void)
 {
-    xSemaphoreTake(g_state_mutex, portMAX_DELAY);
+    ESP_LOGI(TAG, "Resetting configuration to defaults");
     
-    // Read temperature sensor (simplified - in real implementation use DS18B20 driver)
-    // g_thermor_state.current_temp = read_temperature();
+    esp_err_t ret = load_default_config();
+    if (ret == ESP_OK) {
+        ret = thermor_config_save();
+    }
     
-    // Read PIR sensor
-    g_thermor_state.presence_detected = !gpio_get_level(GPIO_PIR_SENSOR);
+    return ret;
+}
+
+// Temperature control functions
+float thermor_get_current_temp(void)
+{
+    float temp;
+    xSemaphoreTake(g_config_mutex, portMAX_DELAY);
+    temp = g_system_config.temperature.current;
+    xSemaphoreGive(g_config_mutex);
+    return temp;
+}
+
+float thermor_get_target_temp(void)
+{
+    float temp;
+    xSemaphoreTake(g_config_mutex, portMAX_DELAY);
+    temp = g_system_config.temperature.target;
+    xSemaphoreGive(g_config_mutex);
+    return temp;
+}
+
+esp_err_t thermor_set_target_temp(float temp)
+{
+    if (temp < TEMP_MIN_CELSIUS || temp > TEMP_MAX_CELSIUS) {
+        return ESP_ERR_INVALID_ARG;
+    }
     
-    // Calculate heating power based on mode and PID
-    float target_temp = g_thermor_state.target_temp;
+    xSemaphoreTake(g_config_mutex, portMAX_DELAY);
+    g_system_config.temperature.target = temp;
+    xSemaphoreGive(g_config_mutex);
     
-    // Adjust target based on mode
-    switch (g_thermor_state.mode) {
-        case THERMOSTAT_MODE_ECO:
-            target_temp -= 3.5f;
+    ESP_LOGI(TAG, "Target temperature set to %.1f°C", temp);
+    return ESP_OK;
+}
+
+// Mode control functions
+heating_mode_t thermor_get_mode(void)
+{
+    heating_mode_t mode;
+    xSemaphoreTake(g_config_mutex, portMAX_DELAY);
+    mode = g_system_config.mode;
+    xSemaphoreGive(g_config_mutex);
+    return mode;
+}
+
+esp_err_t thermor_set_mode(heating_mode_t mode)
+{
+    if (mode > MODE_VACATION) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    
+    xSemaphoreTake(g_config_mutex, portMAX_DELAY);
+    g_system_config.mode = mode;
+    
+    // Apply mode-specific settings
+    switch (mode) {
+        case MODE_OFF:
+            g_system_config.temperature.target = TEMP_MIN_CELSIUS;
             break;
-        case THERMOSTAT_MODE_ANTI_FREEZE:
-            target_temp = 7.0f;
+        case MODE_COMFORT:
+            g_system_config.temperature.target = 21.0f;
             break;
-        case THERMOSTAT_MODE_BOOST:
-            target_temp = TEMP_MAX;
+        case MODE_ECO:
+            g_system_config.temperature.target = 19.0f;
             break;
-        case THERMOSTAT_MODE_OFF:
-            target_temp = 0;
+        case MODE_ANTI_FREEZE:
+            g_system_config.temperature.target = 7.0f;
+            break;
+        case MODE_BOOST:
+            g_system_config.temperature.target = 23.0f;
             break;
         default:
             break;
     }
     
-    // Apply presence detection
-    if (!g_thermor_state.presence_detected && g_thermor_state.mode == THERMOSTAT_MODE_AUTO) {
-        target_temp -= 2.0f;
-    }
+    xSemaphoreGive(g_config_mutex);
     
-    // Window open detection (simplified)
-    if (g_thermor_state.window_open) {
-        target_temp = 0;
-    }
-    
-    // Calculate PID output
-    float pid_output = calculate_pid_output(target_temp, g_thermor_state.current_temp);
-    uint8_t power = (uint8_t)(pid_output > 100.0f ? 100 : (pid_output < 0 ? 0 : pid_output));
-    
-    g_thermor_state.heating_power = power;
-    g_thermor_state.heating_active = power > 0;
-    
-    // Update heating power
-    update_heating_power(power);
-    
-    // Update LEDs
-    gpio_set_level(GPIO_LED_HEATING, g_thermor_state.heating_active);
-    
-    xSemaphoreGive(g_state_mutex);
-}
-
-static void zigbee_report_callback(void *arg)
-{
-    // Report current temperature
-    esp_zb_zcl_set_attribute_val(THERMOR_ENDPOINT_ID, 
-                                 ESP_ZB_ZCL_CLUSTER_ID_THERMOSTAT,
-                                 ESP_ZB_ZCL_CLUSTER_SERVER_ROLE,
-                                 ESP_ZB_ZCL_ATTR_THERMOSTAT_LOCAL_TEMPERATURE_ID,
-                                 (void *)&g_thermor_state.current_temp,
-                                 false);
-    
-    // Report heating demand
-    uint8_t heating_demand = g_thermor_state.heating_power;
-    esp_zb_zcl_set_attribute_val(THERMOR_ENDPOINT_ID,
-                                 ESP_ZB_ZCL_CLUSTER_ID_THERMOSTAT,
-                                 ESP_ZB_ZCL_CLUSTER_SERVER_ROLE,
-                                 ESP_ZB_ZCL_ATTR_THERMOSTAT_PI_HEATING_DEMAND_ID,
-                                 &heating_demand,
-                                 false);
-}
-
-static float calculate_pid_output(float setpoint, float current_value)
-{
-    float error = setpoint - current_value;
-    
-    // Proportional term
-    float p_term = PID_KP * error;
-    
-    // Integral term
-    g_pid_state.integral += error;
-    // Anti-windup
-    if (g_pid_state.integral > 100.0f) g_pid_state.integral = 100.0f;
-    if (g_pid_state.integral < -100.0f) g_pid_state.integral = -100.0f;
-    float i_term = PID_KI * g_pid_state.integral;
-    
-    // Derivative term
-    float d_term = PID_KD * (error - g_pid_state.prev_error);
-    g_pid_state.prev_error = error;
-    
-    return p_term + i_term + d_term;
-}
-
-static void update_heating_power(uint8_t power)
-{
-    // Convert power percentage to phase delay (0-100% -> 10ms-0ms)
-    // For 50Hz mains: half period = 10ms
-    uint32_t delay_us = (100 - power) * 100; // 0-10000us
-    
-    if (power == 0) {
-        // Disable timer
-        gptimer_stop(g_phase_timer);
-        gpio_set_level(GPIO_TRIAC_CTRL, 0);
-    } else {
-        // Update timer alarm value
-        gptimer_alarm_config_t alarm_config = {
-            .reload_count = 0,
-            .alarm_count = delay_us,
-            .flags.auto_reload_on_alarm = false,
-        };
-        gptimer_set_alarm_action(g_phase_timer, &alarm_config);
-    }
-}
-
-static void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
-{
-    uint32_t *p_sg_p       = signal_struct->p_app_signal;
-    esp_err_t err_status   = signal_struct->esp_err_status;
-    esp_zb_app_signal_type_t sig_type = *p_sg_p;
-    
-    switch (sig_type) {
-    case ESP_ZB_BDB_SIGNAL_DEVICE_FIRST_START:
-    case ESP_ZB_BDB_SIGNAL_DEVICE_REBOOT:
-        if (err_status == ESP_OK) {
-            ESP_LOGI(TAG, "Device started up in %s factory-reset mode", 
-                     sig_type == ESP_ZB_BDB_SIGNAL_DEVICE_FIRST_START ? "" : "non");
-            if (esp_zb_bdb_is_factory_new()) {
-                ESP_LOGI(TAG, "Start network formation");
-                esp_zb_bdb_start_top_level_commissioning(ESP_ZB_BDB_MODE_NETWORK_STEERING);
-            } else {
-                ESP_LOGI(TAG, "Device rebooted");
-            }
-        } else {
-            ESP_LOGE(TAG, "Failed to initialize Zigbee stack (status: %s)", 
-                     esp_err_to_name(err_status));
-        }
-        break;
-        
-    case ESP_ZB_BDB_SIGNAL_STEERING:
-        if (err_status == ESP_OK) {
-            esp_zb_ieee_addr_t extended_pan_id;
-            esp_zb_get_extended_pan_id(extended_pan_id);
-            ESP_LOGI(TAG, "Joined network successfully (Extended PAN ID: %02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x, PAN ID: 0x%04hx, Channel:%d)",
-                     extended_pan_id[7], extended_pan_id[6], extended_pan_id[5], extended_pan_id[4],
-                     extended_pan_id[3], extended_pan_id[2], extended_pan_id[1], extended_pan_id[0],
-                     esp_zb_get_pan_id(), esp_zb_get_current_channel());
-            gpio_set_level(GPIO_LED_STATUS, 1);
-        } else {
-            ESP_LOGI(TAG, "Network steering was not successful (status: %s)", esp_err_to_name(err_status));
-            esp_zb_scheduler_alarm((esp_zb_callback_t)esp_zb_bdb_start_top_level_commissioning, ESP_ZB_BDB_MODE_NETWORK_STEERING, 1000);
-        }
-        break;
-        
-    default:
-        ESP_LOGI(TAG, "ZB signal: %s (0x%x), status: %s", esp_zb_app_signal_to_string(sig_type), 
-                 sig_type, esp_err_to_name(err_status));
-        break;
-    }
-}
-
-esp_err_t thermor_set_mode(thermostat_mode_t mode)
-{
-    if (mode > THERMOSTAT_MODE_AUTO) {
-        return ESP_ERR_INVALID_ARG;
-    }
-    
-    xSemaphoreTake(g_state_mutex, portMAX_DELAY);
-    g_thermor_state.mode = mode;
-    xSemaphoreGive(g_state_mutex);
-    
-    ESP_LOGI(TAG, "Mode set to %d", mode);
+    ESP_LOGI(TAG, "Mode changed to %s", thermor_mode_to_string(mode));
     return ESP_OK;
 }
 
-esp_err_t thermor_set_temperature(float temperature)
+const char* thermor_mode_to_string(heating_mode_t mode)
 {
-    if (temperature < TEMP_MIN || temperature > TEMP_MAX) {
+    switch (mode) {
+        case MODE_OFF:         return "OFF";
+        case MODE_COMFORT:     return "COMFORT";
+        case MODE_ECO:         return "ECO";
+        case MODE_ANTI_FREEZE: return "ANTI-FREEZE";
+        case MODE_PROGRAM:     return "PROGRAM";
+        case MODE_BOOST:       return "BOOST";
+        case MODE_VACATION:    return "VACATION";
+        default:               return "UNKNOWN";
+    }
+}
+
+// Power control functions
+uint8_t thermor_get_power_percent(void)
+{
+    uint8_t power;
+    xSemaphoreTake(g_config_mutex, portMAX_DELAY);
+    power = g_system_config.power.current_percent;
+    xSemaphoreGive(g_config_mutex);
+    return power;
+}
+
+esp_err_t thermor_set_power_percent(uint8_t percent)
+{
+    if (percent > 100) {
         return ESP_ERR_INVALID_ARG;
     }
     
-    xSemaphoreTake(g_state_mutex, portMAX_DELAY);
-    g_thermor_state.target_temp = temperature;
-    xSemaphoreGive(g_state_mutex);
+    xSemaphoreTake(g_config_mutex, portMAX_DELAY);
+    g_system_config.power.target_percent = percent;
+    xSemaphoreGive(g_config_mutex);
     
-    // Update Zigbee attribute
-    int16_t temp_zigbee = (int16_t)(temperature * 100);
-    esp_zb_zcl_set_attribute_val(THERMOR_ENDPOINT_ID,
-                                 ESP_ZB_ZCL_CLUSTER_ID_THERMOSTAT,
-                                 ESP_ZB_ZCL_CLUSTER_SERVER_ROLE,
-                                 ESP_ZB_ZCL_ATTR_THERMOSTAT_OCCUPIED_HEATING_SETPOINT_ID,
-                                 &temp_zigbee,
-                                 false);
-    
-    ESP_LOGI(TAG, "Target temperature set to %.1f°C", temperature);
     return ESP_OK;
 }
 
-float thermor_get_current_temperature(void)
+// System state function
+system_state_t thermor_get_system_state(void)
 {
-    return g_thermor_state.current_temp;
+    system_state_t state;
+    xSemaphoreTake(g_config_mutex, portMAX_DELAY);
+    state = g_system_config.state;
+    xSemaphoreGive(g_config_mutex);
+    return state;
 }
 
-void thermor_get_state(thermor_state_t *state)
+// Diagnostic functions
+uint32_t thermor_get_uptime_seconds(void)
 {
-    if (state) {
-        xSemaphoreTake(g_state_mutex, portMAX_DELAY);
-        memcpy(state, &g_thermor_state, sizeof(thermor_state_t));
-        xSemaphoreGive(g_state_mutex);
+    return esp_timer_get_time() / 1000000;
+}
+
+esp_err_t thermor_get_diagnostics(char *buffer, size_t len)
+{
+    if (buffer == NULL || len < 256) {
+        return ESP_ERR_INVALID_ARG;
     }
+    
+    xSemaphoreTake(g_config_mutex, portMAX_DELAY);
+    
+    snprintf(buffer, len,
+            "Mode: %s\n"
+            "State: %d\n"
+            "Current Temp: %.1f°C\n"
+            "Target Temp: %.1f°C\n"
+            "Power: %d%%\n"
+            "Presence: %s\n"
+            "Window: %s\n"
+            "Uptime: %lu seconds\n",
+            thermor_mode_to_string(g_system_config.mode),
+            g_system_config.state,
+            g_system_config.temperature.current,
+            g_system_config.temperature.target,
+            g_system_config.power.current_percent,
+            g_system_config.presence.pir_detected ? "Yes" : "No",
+            g_system_config.presence.window_open ? "Open" : "Closed",
+            thermor_get_uptime_seconds());
+    
+    xSemaphoreGive(g_config_mutex);
+    
+    return ESP_OK;
 }
