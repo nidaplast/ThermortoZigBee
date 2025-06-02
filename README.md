@@ -136,7 +136,7 @@ Les contributions sont les bienvenues ! Voir [CONTRIBUTING.md](docs/CONTRIBUTING
 
 ## 📝 Licence
 
-Ce projet est sous licence MIT - voir [LICENSE](LICENSE)
+Ce projet est sous licence CeCILL - voir [LICENSE](LICENSE)
 
 ## 🙏 Remerciements
 
